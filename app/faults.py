@@ -54,6 +54,19 @@ Logical-destruction interleavings (v1.6, ``scripts/race_destruction.py``) add:
   additionally proves a generic mid-transaction failure is *not* misreported as
   an idempotency conflict.
 
+Migration-session creation (v1.7, ``scripts.race_migration_start.py``) adds:
+
+* ``migration.after_idem_check`` — after every migration pre-check (idempotency
+  lookup, source/target validity, per-source open-session blocker) found no
+  blocker, but before the session insert. Two concurrent requests reusing one
+  ``Idempotency-Key`` for **two different valid source custody records** park
+  here together (their source custody row locks do not overlap), both pass the
+  pre-check, and the later session insert hits ``uq_migration_idem_open`` —
+  pinning the exact interleaving whose 23505 used to be re-raised as an
+  unhandled database error with no denial audit. ``X-Fault-Fail`` values
+  ``:RAISE`` and ``:UNIQUE:<non-target-constraint>`` at the same gate prove
+  other failures are never misread as that conflict.
+
 Header protocol (only honored when fault injection is enabled):
 
 * ``X-Fault-Gate: <name>``        park at that gate until released
@@ -62,12 +75,17 @@ Header protocol (only honored when fault injection is enabled):
                                   visited by the same request; the harness
                                   typically pairs fail-at after_add with
                                   park-at abort_undo).
+* ``X-Fault-Fail: <name>:UNIQUE:<constraint>`` raises an
+  ``asyncpg.UniqueViolationError`` (SQLSTATE 23505) tagged with the given
+  ``constraint_name`` — used to prove that a 23505 from a *non-target*
+  constraint is never misclassified as an idempotency / migration conflict.
 """
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
 
+import asyncpg
 from fastapi import Request
 
 from .errors import ApiError, E_INTEGRITY
@@ -119,19 +137,28 @@ async def maybe_raise(request: Request, gate: str) -> None:
 
     Spec ``<gate>:<ERROR_CODE>`` raises a deterministic ``ApiError`` (mirrors a
     failed audit append / reconstruction); ``<gate>:RAISE`` raises a plain
-    ``RuntimeError`` (mirrors a connection abort hitting the generic path).
+    ``RuntimeError`` (mirrors a connection abort hitting the generic path);
+    ``<gate>:UNIQUE:<constraint>`` raises an ``asyncpg.UniqueViolationError``
+    carrying that (possibly non-target) constraint name (mirrors an unrelated
+    unique index hit that must never be misreported as an idempotency conflict).
     """
     if not enabled(request):
         return
     spec = request.headers.get("x-fault-fail")
     if not spec:
         return
-    name, _, code = spec.partition(":")
+    name, _, rest = spec.partition(":")
     if name != gate:
         return
-    if code == "RAISE":
+    if rest == "RAISE":
         raise RuntimeError(f"injected generic fault at {gate}")
-    raise ApiError(code or E_INTEGRITY, basis={"reason": "injected_fault", "gate": gate})
+    if rest.startswith("UNIQUE:"):
+        exc = asyncpg.UniqueViolationError(
+            f"duplicate key value violates synthetic constraint at {gate}"
+        )
+        exc.constraint_name = rest[len("UNIQUE:"):]
+        raise exc
+    raise ApiError(rest or E_INTEGRITY, basis={"reason": "injected_fault", "gate": gate})
 
 
 async def maybe_park(request: Request, gate: str) -> None:

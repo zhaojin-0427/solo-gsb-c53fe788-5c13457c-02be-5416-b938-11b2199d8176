@@ -28,9 +28,23 @@ the existing claim channel, never in the database (only digests) and never in
 audit rows. Revoked/expired versions, cross-tenant references, concurrent and
 repeated migrations are rejected; distinct idempotency keys can never migrate
 the same custody twice; deterministic failures are safe retries.
+
+Concurrent first-time uses of one ``Idempotency-Key`` against **two different
+valid source custody records** cannot be serialized by the source row locks
+(they are disjoint), so both requests can pass every pre-check; the loser's
+session insert then hits ``uq_migration_idem_open``. The unique-violation
+handler classifies by the **actual constraint name** (never by SQLSTATE
+alone): that partial index with a committed winner bound to a different
+request degrades to a deterministic 409 ``IDEMPOTENCY_CONFLICT`` and a
+separate ``migration.start`` denial audit, with the loser's session insert and
+success audit rolled back (it leaves no session); the same key with the same
+request body replays the committed winner (200); the per-source open/completed
+indexes yield 409 ``MIGRATION_CONFLICT``; any other 23505 or database error is
+re-raised verbatim and never misreported as a conflict.
 """
 from __future__ import annotations
 
+import asyncpg
 from fastapi import APIRouter, Header, Request, Response
 
 from .. import audit, crypto, deps, faults, repo
@@ -437,6 +451,16 @@ async def start_migration(
                                    "source_custody_id": custody["id"]},
                         )
 
+                    # 回归闸门：全部预查（幂等键、源/目标有效性、同源在途/
+                    # 已完成拦截）均未命中之后、INSERT 之前（仅测试构建启用）。
+                    # 两个并发请求同键对“两条不同且有效的源记录”发起迁移时，
+                    # 源 custody 行锁互不重叠，可能双双通过预查——钉住该交错
+                    # 可验证后插入者撞 uq_migration_idem_open 后确定性 409、
+                    # 败方整体回滚并单独补拒绝审计；同处注入的 RAISE / 非目标
+                    # 约束 23505 则必须原样上抛，绝不能误判为幂等冲突。
+                    await faults.maybe_park(request, "migration.after_idem_check")
+                    await faults.maybe_raise(request, "migration.after_idem_check")
+
                     source_digest = _digest_of_policy(source_policy)
                     target_digest = _digest_of_policy(target_policy)
                     migration_id = deps.new_id("mig")
@@ -458,31 +482,64 @@ async def start_migration(
                                 body.target_policy_id, body.target_version, target_digest,
                                 idem_hash, str(ttl),
                             )
-                    except Exception as exc:  # 并发兜底：同键 open / 同源 open / 同源已完成
-                        if getattr(exc, "pgcode", None) != "23505":
-                            raise
-                        await _raise_unique_conflict(conn, tenant["id"], idem_hash, custody["id"])
-                    await audit.append_audit(
-                        conn, tenant_id=tenant["id"], actor_type="tenant",
-                        actor_id=tenant["id"],
-                        action="migration.start", resource=migration_id, result="ok",
-                        basis={
-                            "source_custody_id": custody["id"],
-                            "source_policy_id": custody["policy_id"],
-                            "source_version": custody["policy_version"],
-                            "source_digest": source_digest,
-                            "target_policy_id": body.target_policy_id,
-                            "target_version": body.target_version,
-                            "target_digest": target_digest,
-                            "ttl_seconds": ttl,
-                            "idempotency_key_digest": idem_hash,
-                        },
-                    )
-                    mig_row = await conn.fetchrow(
-                        "SELECT * FROM migration_sessions WHERE id=$1", migration_id
-                    )
-                    out_count, out_new_digests = 0, None
-                source_threshold = source_policy["threshold"]
+                    except asyncpg.UniqueViolationError as exc:
+                        # 并发兜底：同键 open / 同源 open / 同源已完成都可能在此。
+                        # 必须按“实际命中的约束名”分派，绝不能只凭 SQLSTATE=23505：
+                        # 其它唯一约束（主键、注入的非目标 23505）必须原样上抛。
+                        # 唯一索引的等待解析时胜方事务必然已提交（见
+                        # _resolve_unique_conflict 内的可见性复核）。
+                        replay_row = await _resolve_unique_conflict(
+                            conn,
+                            exc=exc,
+                            tenant_id=tenant["id"],
+                            idem_hash=idem_hash,
+                            source_custody_id=custody["id"],
+                            target_policy_id=body.target_policy_id,
+                            target_version=body.target_version,
+                        )
+                    else:
+                        replay_row = None
+                    if replay_row is not None:
+                        # 同键同请求的并发创建：胜方会话已提交，按幂等重放
+                        # 返回那同一份（200，不新建、不重复留痕）。
+                        count = await conn.fetchval(
+                            "SELECT count(*) FROM migration_share_submissions WHERE migration_id=$1",
+                            replay_row["id"],
+                        )
+                        replay_digests = None
+                        if replay_row["new_custody_id"] is not None:
+                            rows = await conn.fetch(
+                                "SELECT shard_digest FROM shards "
+                                "WHERE custody_id=$1 ORDER BY point_x",
+                                replay_row["new_custody_id"],
+                            )
+                            replay_digests = [r["shard_digest"] for r in rows]
+                        mig_row = replay_row
+                        out_count = count
+                        out_new_digests = replay_digests
+                        replayed = True
+                    else:
+                        await audit.append_audit(
+                            conn, tenant_id=tenant["id"], actor_type="tenant",
+                            actor_id=tenant["id"],
+                            action="migration.start", resource=migration_id, result="ok",
+                            basis={
+                                "source_custody_id": custody["id"],
+                                "source_policy_id": custody["policy_id"],
+                                "source_version": custody["policy_version"],
+                                "source_digest": source_digest,
+                                "target_policy_id": body.target_policy_id,
+                                "target_version": body.target_version,
+                                "target_digest": target_digest,
+                                "ttl_seconds": ttl,
+                                "idempotency_key_digest": idem_hash,
+                            },
+                        )
+                        mig_row = await conn.fetchrow(
+                            "SELECT * FROM migration_sessions WHERE id=$1", migration_id
+                        )
+                        out_count, out_new_digests = 0, None
+                    source_threshold = source_policy["threshold"]
         except ApiError as exc:
             # 拒绝同样留痕（独立事务），形成可重放审计；不含任何秘密材料。
             await repo.audit_denied(
@@ -500,42 +557,98 @@ async def start_migration(
     return out
 
 
-async def _raise_unique_conflict(conn, tenant_id: str, idem_hash: str,
-                                 source_custody_id: str) -> None:
-    """Translate a partial-unique-index hit into the deterministic reason."""
-    other_open = await conn.fetchrow(
-        "SELECT id FROM migration_sessions "
-        "WHERE tenant_id=$1 AND idempotency_key_hash=$2 AND status='open' LIMIT 1",
-        tenant_id, idem_hash,
-    )
-    if other_open is not None:
+async def _resolve_unique_conflict(
+    conn,
+    *,
+    exc: asyncpg.UniqueViolationError,
+    tenant_id: str,
+    idem_hash: str,
+    source_custody_id: str,
+    target_policy_id: str,
+    target_version: int,
+):
+    """Resolve a session-INSERT unique violation after the savepoint rolled back.
+
+    Classification is driven by the **actual constraint name** carried by the
+    database error, never by SQLSTATE alone:
+
+    * ``uq_migration_idem_open`` — another request already committed an open
+      session under the same ``(tenant, idempotency_key)``. Same request body →
+      replay that winner (returns its row, HTTP 200); different source/target →
+      deterministic 409 ``IDEMPOTENCY_CONFLICT``.
+    * ``uq_migration_source_open`` / ``uq_migration_source_completed`` —
+      another open / already-completed session for the same source custody →
+      deterministic 409 ``MIGRATION_CONFLICT``.
+    * anything else (primary key, unrelated index, synthetic non-target 23505)
+      is re-raised verbatim so it can never be misreported as a conflict.
+
+    A partial-unique-index conflict in READ COMMITTED only resolves once the
+    winning transaction has committed, so every winner lookup here observes the
+    committed row; a missing row (winner also rolled back) is treated as "not
+    our conflict" and the original database exception is re-raised.
+    """
+    constraint = getattr(exc, "constraint_name", None)
+    if constraint not in (
+        "uq_migration_idem_open",
+        "uq_migration_source_open",
+        "uq_migration_source_completed",
+    ):
+        raise exc
+
+    if constraint == "uq_migration_idem_open":
+        winner = await conn.fetchrow(
+            "SELECT * FROM migration_sessions "
+            "WHERE tenant_id=$1 AND idempotency_key_hash=$2 AND status='open' "
+            "ORDER BY created_at DESC LIMIT 1",
+            tenant_id, idem_hash,
+        )
+        if winner is None:
+            # 占位行不可见（胜方也回滚了）：这不是确定性冲突，原样上抛。
+            raise exc
+        if (
+            winner["source_custody_id"] == source_custody_id
+            and winner["target_policy_id"] == target_policy_id
+            and winner["target_version"] == target_version
+        ):
+            # 同键同请求的并发创建：重放胜方那一份会话（200）。
+            return winner
         raise ApiError(
             E_IDEMPOTENCY_CONFLICT,
             basis={"reason": "concurrent_open_with_same_idempotency_key",
-                   "migration_id": other_open["id"]},
+                   "idempotency_key_digest": idem_hash,
+                   "migration_id": winner["id"],
+                   "winner_source_custody_id": winner["source_custody_id"]},
         )
-    dup_open = await conn.fetchrow(
-        "SELECT id FROM migration_sessions WHERE source_custody_id=$1 AND status='open' LIMIT 1",
-        source_custody_id,
-    )
-    if dup_open is not None:
+
+    if constraint == "uq_migration_source_open":
+        other_open = await conn.fetchrow(
+            "SELECT id FROM migration_sessions "
+            "WHERE source_custody_id=$1 AND status='open' "
+            "ORDER BY created_at DESC LIMIT 1",
+            source_custody_id,
+        )
+        if other_open is None:
+            raise exc
         raise ApiError(
             E_MIGRATION_CONFLICT,
             basis={"reason": "open_migration_exists_for_custody",
-                   "migration_id": dup_open["id"], "source_custody_id": source_custody_id},
-        )
-    done = await conn.fetchrow(
-        "SELECT id FROM migration_sessions "
-        "WHERE source_custody_id=$1 AND new_custody_id IS NOT NULL LIMIT 1",
-        source_custody_id,
-    )
-    if done is not None:
-        raise ApiError(
-            E_MIGRATION_CONFLICT,
-            basis={"reason": "custody_already_migrated", "migration_id": done["id"],
+                   "migration_id": other_open["id"],
                    "source_custody_id": source_custody_id},
         )
-    raise ApiError(E_MIGRATION_CONFLICT, basis={"reason": "duplicate_migration"})
+
+    done = await conn.fetchrow(
+        "SELECT id FROM migration_sessions "
+        "WHERE source_custody_id=$1 AND new_custody_id IS NOT NULL "
+        "ORDER BY completed_at DESC NULLS LAST, created_at DESC LIMIT 1",
+        source_custody_id,
+    )
+    if done is None:
+        raise exc
+    raise ApiError(
+        E_MIGRATION_CONFLICT,
+        basis={"reason": "custody_already_migrated", "migration_id": done["id"],
+               "source_custody_id": source_custody_id},
+    )
 
 
 @router.get("/migrations/{migration_id}", response_model=MigrationSessionOut)

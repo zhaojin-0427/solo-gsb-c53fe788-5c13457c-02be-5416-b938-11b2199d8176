@@ -45,6 +45,24 @@ v1.4 新增**跨策略密钥迁移**：租户对仍有效的托管记录指定�
 > 另一次稳定 409）、D9b（同键同根并发重试得同一回执）、D9c（双闸门同时放行，
 > 结果集合恒为 {201, 409}）、D9d（通用故障仍是 500，不误判为幂等冲突）。
 
+> **修复要点（v1.7）**：修复 `POST /migrations` **并发创建迁移会话的幂等错误**。
+> 同一租户用同一个 `Idempotency-Key` **同时**为**两条不同且有效**的源托管记录发起迁移时，
+> 两侧源 custody 行锁互不重叠，可能**双双通过预查**（幂等键、源/目标有效性、同源在途拦截
+> 均未命中）；后插入者随即撞上 `uq_migration_idem_open`。旧代码只用
+> `getattr(exc, "pgcode", None) != "23505"` 判别——而 asyncpg 的异常对象**并不带
+> `pgcode` 属性**（SQLSTATE 在 `sqlstate` 上，且更可靠的判别是实际约束名），导致任何
+> 唯一违规都被原样上抛：调用方得到未处理的 **500**，也**漏记拒绝审计**。现改为在
+> savepoint 捕获 `asyncpg.UniqueViolationError`，按**实际命中的约束名**分派：
+> `uq_migration_idem_open` 且胜方已提交、请求体不同 → **409 `IDEMPOTENCY_CONFLICT`**
+> （basis 带胜方 `migration_id`），请求体相同 → **200 重放胜方会话**；
+> `uq_migration_source_open` / `uq_migration_source_completed` → **409
+> `MIGRATION_CONFLICT`**；**非目标约束的 23505 与其它数据库错误原样上抛为 500，绝不误判**。
+> 败方的会话插入与成功审计随 savepoint 回滚（**不留下迁移会话**），409 由独立事务**单独
+> 补一条 `migration.start` denied 审计**；胜方会话提交后可 `GET /migrations/{id}` 查询。
+> 回归验证见 `scripts/race_migration_start.py` 的 S1/S2（预查后交错：恰一次 201、败方稳定
+> 409 且只留拒绝审计）、S3（同键同源并发得 200 同一份）、S4（异键同源得
+> `MIGRATION_CONFLICT`）、S5/S6（非目标约束 23505 与通用故障仍为 500，可干净重试）。
+
 > **修复要点（v1.5）**：修复**跨策略迁移在待累计分片丢失后卡死**的问题。旧代码里，首名托管人
 > 已提交分片（数据库计数=1）后若 API 进程重启或内存池淘汰该分片，另一名托管人的提交会让
 > 数据库计数达到源门限、内存分片却不足——`/migrations/shares` 返回 `THRESHOLD_NOT_MET`
@@ -147,18 +165,19 @@ docker compose exec api python -m app.seed
 ## 2. 快速体验（端到端）
 
 容器自带完整验收脚本，覆盖正常恢复、每一种拒绝依据、并发竞态、跨策略迁移、
-迁移缺片故障转移、**托管记录谱系逻辑销毁**与审计链重放：
+迁移创建并发幂等、迁移缺片故障转移、**托管记录谱系逻辑销毁**与审计链重放：
 
 ```bash
 # 1) 并发回滚竞态回归（scripts.race_recovery，38 项）
 # 2) 迁移缺片故障转移回归（scripts.race_migration，37 项）
-# 3) 谱系逻辑销毁回归（scripts.race_destruction，D1–D9）
-# 4) 端到端验收（scripts.demo，含销毁全流程）
+# 3) 迁移创建并发幂等回归（scripts.race_migration_start，S1–S6）
+# 4) 谱系逻辑销毁回归（scripts.race_destruction，D1–D9）
+# 5) 端到端验收（scripts.demo，含销毁全流程）
 docker compose --profile demo run --rm demo
 ```
 
 期望依次输出 `RACE REGRESSION CHECKS PASSED`、`MIGRATION FAILOVER CHECKS PASSED`、
-`DESTRUCTION CHECKS PASSED` 与 `ALL CHECKS PASSED`。
+`MIGRATION START IDEMPOTENCY CHECKS PASSED`、`DESTRUCTION CHECKS PASSED` 与 `ALL CHECKS PASSED`。
 
 `scripts.race_recovery.py` 在进程内以真实 ASGI + 真实 PostgreSQL 行锁运行，通过仅测试构建启用的
 故障注入闸门（`KEYVAULT_FAULT_INJECTION=1`，API 服务默认关闭、关闭时零开销）精确钉住交错点：
@@ -170,6 +189,14 @@ docker compose --profile demo run --rm demo
 `PendingShareStore`，数据库提交计数保留）：断言检出缺片的提交把迁移会话同事务置为可查询的
 `failed` 终态、本次分片完整撤销（计数/nonce/内存）、行锁等待者只得 `MIGRATION_FAILED`、
 新幂等键与同一键都能从源记录安全重新发起且只产生一个新托管记录、`migration.fail` 无明文入审计链。
+`scripts.race_migration_start.py` 以 `migration.after_idem_check` 闸门钉住**同一租户用同一
+幂等键同时为两条不同且有效的源托管记录发起迁移**的预查后交错（S1/S2）：两侧源 custody 行锁互不
+重叠、双双通过幂等/同源预查，后插入者撞 `uq_migration_idem_open`——断言恰一次 201、败方稳定
+409 `IDEMPOTENCY_CONFLICT`（响应 basis 带胜方 `migration_id`），败方**不留下迁移会话也不留成功
+审计**、单独补一条 `migration.start`/`denied` 审计，胜方会话可 GET 查询；同键同源的并发创建在源
+行锁上排队后按幂等重放返回 **200 同一份会话**（S3）；不同键同源排队者得 409
+`MIGRATION_CONFLICT`（S4）；预查后注入的**非目标约束 23505**（S5）与通用故障（S6）一律 500，
+绝不误判为幂等冲突，回滚后同键可干净重试。
 `scripts.race_destruction.py` 钉住**逻辑销毁 × 迁移完成/分片领取/份额提交**的行锁交错
 （销毁在持谱系 custody 锁、会话锁前 park，使在途请求排队）：断言先后确定、输掉交错的旧会话
 只得到 `CUSTODY_DESTROYED`（不再下发分片/密文、不产生漏删后代）、迁移先赢时新后代必被纳入
@@ -182,9 +209,10 @@ docker compose --profile demo run --rm demo
 ```bash
 KEYVAULT_FAULT_INJECTION=1 \
 KEYVAULT_DATABASE_URL=postgresql://keyvault:keyvault@localhost:5432/keyvault \
-python -m scripts.race_recovery      # 并发回滚竞态
-python -m scripts.race_migration     # 迁移缺片故障转移
-python -m scripts.race_destruction   # 谱系逻辑销毁并发交错
+python -m scripts.race_recovery            # 并发回滚竞态
+python -m scripts.race_migration           # 迁移缺片故障转移
+python -m scripts.race_migration_start     # 迁移创建并发幂等（同键/同源/非目标约束）
+python -m scripts.race_destruction         # 谱系逻辑销毁并发交错
 ```
 
 以下用 curl 走一遍核心流程（演示凭据见 `python -m app.seed` 输出）：
@@ -298,40 +326,133 @@ TENANT=tsec_...   # python -m app.seed 输出
 # (1) 租户创建迁移会话：必须带 Idempotency-Key；绑定源 custody 与目标策略版本
 curl -s -X POST localhost:8000/migrations -H "X-API-Key: $TENANT" \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: migrate-2026-09-26-0001' -d '{
-    "source_custody_id":"cus_secret_...",
+    "source_custody_id":"cus_secret_30bf8fa9491b0fa26a9c66a2",
     "target_policy_id":"pol_next",
     "target_version":1,
     "ttl_seconds":300
   }'
-# -> migration_id、source_digest/target_digest（不可变版本行摘要）、status=open、threshold(源门限)
-#    同键同体重放返回 200 + 同一会话（不新建、不重复留痕）；首次创建为 201
+```
 
+首次创建返回 **201**（下例来自真实运行；`migration_id`/各 id/时间戳随环境变化）：
+
+```json
+{
+  "migration_id": "mig_2933ebd24b57824c53eca9b7",
+  "source_custody_id": "cus_secret_30bf8fa9491b0fa26a9c66a2",
+  "source_policy_id": "pol_next_src",
+  "source_version": 1,
+  "source_digest": "f932550b58806031a97d22bc41b28aba913d206fbcdfa6c6b67a6f752b1bbebc",
+  "target_policy_id": "pol_next",
+  "target_version": 1,
+  "target_digest": "46c8ef322c25f0242d528f220273e82b5962abbe67071ed54f3c4eba51d83a43",
+  "status": "open",
+  "valid_until": "2026-10-02T11:34:13.593542Z",
+  "shares_received": 0,
+  "threshold": 2,
+  "new_custody_id": null,
+  "new_shard_count": null,
+  "new_shard_digests": null
+}
+```
+
+同键同体重放（含并发的在途重试）返回 **200 + 同一会话**（不新建、不重复留痕）：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/migrations \
+  -H "X-API-Key: $TENANT" -H 'Idempotency-Key: migrate-2026-09-26-0001' \
+  -H 'Content-Type: application/json' -d '{
+    "source_custody_id":"cus_secret_30bf8fa9491b0fa26a9c66a2",
+    "target_policy_id":"pol_next","target_version":1,"ttl_seconds":300}'
+# -> 200（响应体 migration_id 与 201 那一份完全一致）
+```
+
+同键绑定到**另一条源记录**（串行预查命中，或两侧源行锁互不重叠时由
+`uq_migration_idem_open` 兜底）返回 **409 `IDEMPOTENCY_CONFLICT`**：
+
+```json
+{
+  "error": {
+    "code": "IDEMPOTENCY_CONFLICT",
+    "message": "idempotency key is already bound to a different request",
+    "basis": {
+      "reason": "concurrent_open_with_same_idempotency_key",
+      "idempotency_key_digest": "d2e9dd221ece913ad8eced5511edc37f7514aa7bc532b4434ad98e61519249c8",
+      "migration_id": "mig_2933ebd24b57824c53eca9b7",
+      "winner_source_custody_id": "cus_secret_30bf8fa9491b0fa26a9c66a2"
+    }
+  }
+}
+```
+
+> 串行预查命中时 `reason` 为 `key_bound_to_different_request`；并发后插入者的 basis 为
+> `concurrent_open_with_same_idempotency_key` 并带胜方 `migration_id`。败方会话插入随
+> savepoint 回滚——**不留下迁移会话、不留成功审计**，拒绝由独立事务单独记一条
+> `migration.start` / `denied` / `IDEMPOTENCY_CONFLICT` 审计；换新幂等键即可从该源记录重试。
+
+不同键对同一源 custody 发起（在途）返回 **409 `MIGRATION_CONFLICT`**：
+
+```json
+{
+  "error": {
+    "code": "MIGRATION_CONFLICT",
+    "message": "a different open migration already exists for this custody, or the same custody is already migrated",
+    "basis": {
+      "reason": "open_migration_exists_for_custody",
+      "migration_id": "mig_2933ebd24b57824c53eca9b7",
+      "source_custody_id": "cus_secret_30bf8fa9491b0fa26a9c66a2"
+    }
+  }
+}
+```
+
+```bash
 # (2) 源策略托管人领取一次性挑战值（与恢复同构）
 curl -s -X POST localhost:8000/migrations/nonces -H "X-API-Key: $CUSTODIAN_KEY" \
-  -H 'Content-Type: application/json' -d '{"migration_id":"mig_..."}'
+  -H 'Content-Type: application/json' -d '{"migration_id":"mig_2933ebd24b57824c53eca9b7"}'
 # -> nonce + point_x + shard_digest + source/target_digest
 
 # (3) 托管人领取本人“源分片”（明文仅在本次响应出现，不落盘/不入审计）
 curl -s -X POST localhost:8000/migrations/shards/claim -H "X-API-Key: $CUSTODIAN_KEY" \
-  -H 'Content-Type: application/json' -d '{"migration_id":"mig_...","nonce":"..."}'
+  -H 'Content-Type: application/json' -d '{"migration_id":"mig_2933ebd24b57824c53eca9b7","nonce":"..."}'
 # -> shard_hex + signing_message（keyvault.migration.v1：逐行绑定
 #    migration/source_digest/target_digest/nonce/custodian/point/shard_digest）
 
 # (4) 托管人本地 Ed25519 签名后，提交本人源分片 + 签名
 curl -s -X POST localhost:8000/migrations/shares -H "X-API-Key: $CUSTODIAN_KEY" \
   -H 'Content-Type: application/json' -d '{
-    "migration_id":"mig_...","nonce":"...","point_x":1,
+    "migration_id":"mig_2933ebd24b57824c53eca9b7","nonce":"...","point_x":1,
     "shard_hex":"<领取到的本人源分片 hex>","signature":"<64B ed25519 hex>"}'
 
-# (5) 达到源门限的那一次（如 2-of-3 的第 2 份）：
-# -> completed=true、new_custody_id、new_shard_count、new_shard_digests[]
+# (5) 达到源门限的那一次（如 2-of-3 的第 2 份）真实响应：
+```
+
+```json
+{
+  "migration_id": "mig_2933ebd24b57824c53eca9b7",
+  "status": "completed",
+  "shares_received": 2,
+  "threshold": 2,
+  "completed": true,
+  "new_custody_id": "cus_secret_92f675f9bb33ad116648e5fc",
+  "new_shard_count": 3,
+  "new_shard_digests": [
+    "a647cb33cca79fb88a11878d47ad14bfabe34f76210ca571dcc8821c17a530c3",
+    "b0fca4208d87cdf3186c7263704d49d65187afb4cb17e1e3164298581c8259d0",
+    "12ae68c015aee369f32f12be55b9a2a3ff0662a1c464a54d0db2376645b83ec8"
+  ]
+}
+```
+
+```bash
 #    服务端仅用已验签源分片在内存重组 -> 立即按目标策略重新分片 ->
 #    新托管记录 + 新加密分片在同一事务写入；源 custody/shards 一行未改，
 #    响应不含秘密或分片明文。新记录此后即可按目标策略正常 POST /recoveries。
 
 # 查询迁移会话（幂等/排障）
-curl -s localhost:8000/migrations/mig_... -H "X-API-Key: $TENANT"
+curl -s localhost:8000/migrations/mig_2933ebd24b57824c53eca9b7 -H "X-API-Key: $TENANT"
 # -> status(open|completed|expired|failed)、shares_received、threshold、new_custody_id
+#    完成后 GET 的真实响应与上例结构一致：status="completed"、shares_received=2、
+#    new_custody_id="cus_secret_92f675f9bb33ad116648e5fc"、new_shard_count=3
 ```
 
 **迁移的拒绝与重试语义**：
@@ -360,8 +481,15 @@ curl -s localhost:8000/migrations/mig_... -H "X-API-Key: $TENANT"
   均得 `MIGRATION_FAILED`（绝不可能再完成），`failed` 不占 open 唯一索引——**失败重试**：
   直接换新幂等键（或沿用同一键）重新 `POST /migrations` 即可从源记录再发起；
   失败会话没有 `new_custody_id`，重试完成前不会产生任何新托管记录，完成后也全局唯一。
-- 并发创建由源 custody 行锁串行化 + 部分唯一索引兜底：同键并发恰有一次 201、另一次重放 200；
-  不同键并发恰有一次 201、另一次 `MIGRATION_CONFLICT`。
+- 并发创建由源 custody 行锁串行化 + 部分唯一索引兜底。唯一违规按**实际命中的约束名**分派
+  （绝不只凭 SQLSTATE=23505）：
+  - 同键**同源**并发：后到者在源行锁上排队，胜方提交后经预查重放，返回 **200 同一份会话**；
+  - 同键**异源**并发（行锁互不重叠、双双通过预查）：后插入者撞 `uq_migration_idem_open`，
+    返回 409 `IDEMPOTENCY_CONFLICT`（reason=`concurrent_open_with_same_idempotency_key`，
+    basis 带胜方 `migration_id`），败方不留下会话/成功审计，单独补拒绝审计，换新键可重试；
+  - 不同键同源并发：排队者预查命中在途会话，返回 409 `MIGRATION_CONFLICT`
+    （`open_migration_exists_for_custody`；已完成则 `custody_already_migrated`）；
+  - 非目标约束的 23505（如主键冲突）或其它数据库错误**原样上抛为 500，绝不误判**为冲突。
 
 ### 2.10 托管记录谱系逻辑销毁（curl 流程）
 

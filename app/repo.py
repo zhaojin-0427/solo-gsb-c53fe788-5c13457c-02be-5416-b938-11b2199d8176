@@ -7,6 +7,21 @@ import asyncpg
 from . import audit
 
 
+def unique_constraint_name(exc: BaseException) -> str | None:
+    """SQLSTATE 23505（unique_violation）冲突的**实际约束名**；否则返回 None。
+
+    asyncpg 把 SQLSTATE 放在 ``sqlstate``（``pgcode`` 是 psycopg 风格属性，
+    asyncpg 异常上并不存在——只读 ``pgcode`` 会把唯一冲突误判为未知错误
+    原样上抛，既丢确定性 4xx，也漏记拒绝审计）；部分唯一索引冲突时
+    ``constraint_name`` 即索引名。调用方必须同时核对 SQLSTATE 与约束名，
+    只翻译已知的占位约束，其余一律原样上抛，绝不误判。
+    """
+    sqlstate = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+    if sqlstate != "23505":
+        return None
+    return getattr(exc, "constraint_name", None)
+
+
 async def audit_denied(
     pool: asyncpg.Pool,
     *,

@@ -33,6 +33,23 @@ second submitter queues on the lock, proving the queued request can only fail
 fast with ``MIGRATION_FAILED`` once the gap detector commits the ``failed``
 terminal state — never complete the doomed session.
 
+Migration-session creation (v1.6.2, ``scripts/race_migration_idem.py``) adds:
+
+* ``migration.after_idem_check`` — after the idempotency pre-check and all
+  deterministic validation passed, right before the open-session placeholder
+  row is inserted. Two concurrent requests reusing one ``Idempotency-Key``
+  for **different** source custodies park here together (their custody row
+  locks do not overlap), so both pass the pre-check and the later insert hits
+  ``uq_migration_idem_open`` — pinning the exact interleaving that used to
+  surface as an unhandled database error, and proving the loser now gets a
+  deterministic ``IDEMPOTENCY_CONFLICT`` (409) with a separately committed
+  denial audit while the winner stays queryable.
+* ``migration.insert`` — inside the insert savepoint, just before the
+  ``INSERT``. ``X-Fault-Fail: migration.insert:PG23505:<constraint>``
+  injects a unique violation carrying a **non-target** constraint name and
+  ``...:RAISE`` a generic database error, proving neither is mistranslated
+  into an idempotency conflict.
+
 Logical-destruction interleavings (v1.6, ``scripts/race_destruction.py``) add:
 
 * ``destruction.after_lineage_lock`` — after every custody row of the migration
@@ -62,12 +79,23 @@ Header protocol (only honored when fault injection is enabled):
                                   visited by the same request; the harness
                                   typically pairs fail-at after_add with
                                   park-at abort_undo).
+* ``X-Fault-Fail: <name>:RAISE``  at that gate raise a plain ``RuntimeError``
+                                  (mirrors a connection abort hitting the
+                                  generic path).
+* ``X-Fault-Fail: <name>:PG23505[:<constraint>]``
+                                  at that gate raise a real
+                                  ``asyncpg.UniqueViolationError`` (SQLSTATE
+                                  23505) carrying the given constraint/index
+                                  name — mirrors a unique violation surfaced
+                                  by the database, used to prove non-target
+                                  constraints are never mistranslated.
 """
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
 
+import asyncpg
 from fastapi import Request
 
 from .errors import ApiError, E_INTEGRITY
@@ -119,7 +147,11 @@ async def maybe_raise(request: Request, gate: str) -> None:
 
     Spec ``<gate>:<ERROR_CODE>`` raises a deterministic ``ApiError`` (mirrors a
     failed audit append / reconstruction); ``<gate>:RAISE`` raises a plain
-    ``RuntimeError`` (mirrors a connection abort hitting the generic path).
+    ``RuntimeError`` (mirrors a connection abort hitting the generic path);
+    ``<gate>:PG23505[:<constraint>]`` raises a real
+    ``asyncpg.UniqueViolationError`` carrying SQLSTATE 23505 and the given
+    constraint/index name (mirrors a unique violation on a non-target
+    constraint, which must never be mistranslated into a 4xx).
     """
     if not enabled(request):
         return
@@ -131,6 +163,13 @@ async def maybe_raise(request: Request, gate: str) -> None:
         return
     if code == "RAISE":
         raise RuntimeError(f"injected generic fault at {gate}")
+    if code == "PG23505" or code.startswith("PG23505:"):
+        _, _, constraint = code.partition(":")
+        constraint = constraint or "uq_non_target_constraint"
+        exc = asyncpg.UniqueViolationError(
+            f'duplicate key value violates unique constraint "{constraint}"')
+        exc.constraint_name = constraint
+        raise exc
     raise ApiError(code or E_INTEGRITY, basis={"reason": "injected_fault", "gate": gate})
 
 

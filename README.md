@@ -45,6 +45,26 @@ v1.4 新增**跨策略密钥迁移**：租户对仍有效的托管记录指定�
 > 另一次稳定 409）、D9b（同键同根并发重试得同一回执）、D9c（双闸门同时放行，
 > 结果集合恒为 {201, 409}）、D9d（通用故障仍是 500，不误判为幂等冲突）。
 
+> **修复要点（v1.6.2）**：修复 `POST /migrations` **并发复用同一幂等键创建迁移会话**
+> 时的未处理数据库错误。同一租户以相同 `Idempotency-Key` 同时为**两个不同且有效**的
+> 源托管记录发起迁移时，两个请求的 custody 行锁互不重叠，可能**双双通过幂等预查**
+> （都查不到既有会话）；后插入者随后撞上 `uq_migration_idem_open` 部分唯一索引——
+> 旧代码只读 `pgcode`（asyncpg 异常只有 `sqlstate`/`constraint_name`，没有该属性），
+> 唯一冲突被当成未知错误原样上抛：调用方得到未处理的 500，也不留约定的拒绝审计。
+> 现改为按 **SQLSTATE 23505 + 实际约束名**分派（`app/repo.py` 的
+> `unique_constraint_name`）：`uq_migration_idem_open`（同键）→ 重读赢家**已提交**
+> 会话（唯一索引的等待已解析，能撞上即说明赢家已提交），同键同请求按幂等重放返回
+> **原会话**（200），同键不同请求返回 **409 `IDEMPOTENCY_CONFLICT`** 并在独立事务
+> 留下与实际结果一致的 `migration.start` denied 审计；`uq_migration_source_open` /
+> `uq_migration_source_completed`（同源在途/已完成）保持 **`MIGRATION_CONFLICT`**；
+> **其它约束或任何非唯一冲突的数据库错误原样上抛，绝不误判为幂等冲突**。败方事务
+> 整体回滚——不留迁移会话、不留成功审计；胜方会话可正常 `GET /migrations/{id}`。
+> 回归验证见 `scripts/race_migration_idem.py`（I1：预查后交错恰一次 201、另一次
+> 稳定 409 且败方无会话/无成功审计、拒绝审计恰一条；I2：同键同请求并发重试经行锁
+> 串行化后 201→200 重放；I3：双闸门同时放行结果集合恒为 {201, 409}；I4：不同键
+> 同源保持 `MIGRATION_CONFLICT`；I5：非目标约束的唯一冲突仍是 500 不误判；
+> I6：插入点通用错误仍是 500 且同键可安全重试）。
+
 > **修复要点（v1.5）**：修复**跨策略迁移在待累计分片丢失后卡死**的问题。旧代码里，首名托管人
 > 已提交分片（数据库计数=1）后若 API 进程重启或内存池淘汰该分片，另一名托管人的提交会让
 > 数据库计数达到源门限、内存分片却不足——`/migrations/shares` 返回 `THRESHOLD_NOT_MET`
@@ -147,18 +167,20 @@ docker compose exec api python -m app.seed
 ## 2. 快速体验（端到端）
 
 容器自带完整验收脚本，覆盖正常恢复、每一种拒绝依据、并发竞态、跨策略迁移、
-迁移缺片故障转移、**托管记录谱系逻辑销毁**与审计链重放：
+迁移缺片故障转移、**托管记录谱系逻辑销毁**、**迁移创建并发幂等**与审计链重放：
 
 ```bash
 # 1) 并发回滚竞态回归（scripts.race_recovery，38 项）
 # 2) 迁移缺片故障转移回归（scripts.race_migration，37 项）
 # 3) 谱系逻辑销毁回归（scripts.race_destruction，D1–D9）
-# 4) 端到端验收（scripts.demo，含销毁全流程）
+# 4) 迁移创建并发幂等回归（scripts.race_migration_idem，I1–I6）
+# 5) 端到端验收（scripts.demo，含销毁全流程）
 docker compose --profile demo run --rm demo
 ```
 
 期望依次输出 `RACE REGRESSION CHECKS PASSED`、`MIGRATION FAILOVER CHECKS PASSED`、
-`DESTRUCTION CHECKS PASSED` 与 `ALL CHECKS PASSED`。
+`DESTRUCTION CHECKS PASSED`、`MIGRATION IDEMPOTENCY RACE CHECKS PASSED`
+与 `ALL CHECKS PASSED`。
 
 `scripts.race_recovery.py` 在进程内以真实 ASGI + 真实 PostgreSQL 行锁运行，通过仅测试构建启用的
 故障注入闸门（`KEYVAULT_FAULT_INJECTION=1`，API 服务默认关闭、关闭时零开销）精确钉住交错点：
@@ -177,14 +199,21 @@ docker compose --profile demo run --rm demo
 闸门钉住**并发复用同一幂等键的回执预查交错**（D9）：两个请求双双通过预查后，恰一次 201、
 另一次稳定 409 `IDEMPOTENCY_CONFLICT`，败方谱系销毁/分片删除/会话阻断/完成审计整体回滚、
 拒绝审计与实际结果一致，通用故障仍表现为 500 而**不误判**为幂等冲突。
+`scripts.race_migration_idem.py` 以 `migration.after_idem_check` 闸门钉住**并发复用同一幂等键
+创建迁移会话的预查后交错**（I1–I3）：同键对两个不同源记录的请求双双通过预查后，恰一次 201
+（胜方可查询）、另一次稳定 409 `IDEMPOTENCY_CONFLICT`，败方不留会话与成功审计、拒绝审计
+恰一条；同键同请求并发重试经 custody 行锁串行化后 201→200 重放同一会话；不同键同源保持
+`MIGRATION_CONFLICT`；并以 `migration.insert` 闸门注入**非目标约束的唯一冲突**与通用数据库
+错误（I5/I6），断言二者仍是 500、绝不误判为幂等冲突、同键可安全重试。
 本地单独运行：
 
 ```bash
 KEYVAULT_FAULT_INJECTION=1 \
 KEYVAULT_DATABASE_URL=postgresql://keyvault:keyvault@localhost:5432/keyvault \
-python -m scripts.race_recovery      # 并发回滚竞态
-python -m scripts.race_migration     # 迁移缺片故障转移
-python -m scripts.race_destruction   # 谱系逻辑销毁并发交错
+python -m scripts.race_recovery        # 并发回滚竞态
+python -m scripts.race_migration       # 迁移缺片故障转移
+python -m scripts.race_destruction     # 谱系逻辑销毁并发交错
+python -m scripts.race_migration_idem  # 迁移创建并发幂等
 ```
 
 以下用 curl 走一遍核心流程（演示凭据见 `python -m app.seed` 输出）：
@@ -360,8 +389,64 @@ curl -s localhost:8000/migrations/mig_... -H "X-API-Key: $TENANT"
   均得 `MIGRATION_FAILED`（绝不可能再完成），`failed` 不占 open 唯一索引——**失败重试**：
   直接换新幂等键（或沿用同一键）重新 `POST /migrations` 即可从源记录再发起；
   失败会话没有 `new_custody_id`，重试完成前不会产生任何新托管记录，完成后也全局唯一。
-- 并发创建由源 custody 行锁串行化 + 部分唯一索引兜底：同键并发恰有一次 201、另一次重放 200；
-  不同键并发恰有一次 201、另一次 `MIGRATION_CONFLICT`。
+- 并发创建由源 custody 行锁串行化 + 部分唯一索引兜底：**同键同源**并发恰有一次 201、
+  另一次经预查重放 200；**不同键同源**恰有一次 201、另一次 `MIGRATION_CONFLICT`；
+  **同键不同源**（两个不同且有效的源记录共用一键并发首次使用）行锁互不重叠、可能双双
+  通过预查，后插入者撞 `uq_migration_idem_open` 后按 SQLSTATE 23505 + 实际约束名确定性
+  翻译——恰一次 201、另一次 409 `IDEMPOTENCY_CONFLICT`（败方整体回滚：不留会话、不留
+  成功审计，拒绝审计独立落痕；非目标约束/其它数据库错误原样上抛，绝不误判为冲突）。
+
+**并发同键 × 两个不同源记录的实际行为**（回归脚本 `scripts/race_migration_idem.py` 钉住同一交错）：
+
+```bash
+# 请求 A（源记录 cus_secret_A）与请求 B（源记录 cus_secret_B）携带同一幂等键并发发出，
+# 双双通过幂等预查后，恰有一个胜出（201）：
+curl -s -X POST localhost:8000/migrations -H "X-API-Key: $TENANT" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: migrate-2026-10-02-0001' -d '{
+    "source_custody_id":"cus_secret_A","target_policy_id":"pol_next","target_version":1}'
+# <- 201 Created
+# {
+#   "migration_id": "mig_9f2c…",
+#   "source_custody_id": "cus_secret_A",
+#   "source_policy_id": "pol_main", "source_version": 1,
+#   "source_digest": "<64 hex>",
+#   "target_policy_id": "pol_next", "target_version": 1,
+#   "target_digest": "<64 hex>",
+#   "status": "open", "valid_until": "2026-10-02T12:05:00+00:00",
+#   "shares_received": 0, "threshold": 2,
+#   "new_custody_id": null, "new_shard_count": null, "new_shard_digests": null
+# }
+
+# 后插入者（败方）整体回滚，稳定返回 409，basis 指明赢家会话：
+# <- 409 Conflict
+# {
+#   "error": {
+#     "code": "IDEMPOTENCY_CONFLICT",
+#     "message": "idempotency key is already bound to a different request",
+#     "basis": {"reason": "concurrent_open_with_same_idempotency_key",
+#               "migration_id": "mig_9f2c…",
+#               "idempotency_key_digest": "<sha256(Idempotency-Key)>"}
+#   }
+# }
+
+# 胜方会话可正常查询；败方不留会话、不留成功审计（拒绝审计独立落痕）：
+curl -s localhost:8000/migrations/mig_9f2c… -H "X-API-Key: $TENANT"
+# <- 200 {"migration_id":"mig_9f2c…","status":"open", ...}
+
+# 顺序重发（非并发）同键不同请求 -> 预查路径的同一确定性 409（reason 不同）：
+curl -s -X POST localhost:8000/migrations -H "X-API-Key: $TENANT" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: migrate-2026-10-02-0001' -d '{
+    "source_custody_id":"cus_secret_B","target_policy_id":"pol_next","target_version":1}'
+# <- 409 {"error":{"code":"IDEMPOTENCY_CONFLICT",
+#          "basis":{"reason":"key_bound_to_different_request",
+#                   "idempotency_key_digest":"<sha256(Idempotency-Key)>"}}}
+
+# 败方换新幂等键即可立即重试（败方不占位）；同键同请求重发仍返回胜方原会话（200）
+curl -s -X POST localhost:8000/migrations -H "X-API-Key: $TENANT" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: migrate-2026-10-02-0002' -d '{
+    "source_custody_id":"cus_secret_B","target_policy_id":"pol_next","target_version":1}'
+# <- 201 Created（新会话）
+```
 
 ### 2.10 托管记录谱系逻辑销毁（curl 流程）
 
@@ -590,8 +675,12 @@ AAD 绑定会话全部要素，密文无法被挪到别的会话复用。待累�
 - `UNIQUE(source_custody_id) WHERE status='open'`：同一 custody 至多一个进行中迁移；
 - `UNIQUE(source_custody_id) WHERE new_custody_id IS NOT NULL`：已迁移 custody 全局唯一。
 
-创建在源 custody 行 `FOR UPDATE` 锁内完成，并发被串行化，索引再兜底。每个关口（nonce/claim/submit）
-都在迁移行锁内重新校验：会话未完成/未过期、绑定的源/目标**版本摘要**与不可变版本行逐字节一致、
+创建在源 custody 行 `FOR UPDATE` 锁内完成，同源并发被串行化，索引再兜底；同键对**不同**
+源记录的并发首次使用行锁互不重叠、可能双双通过幂等预查，后插入者撞 `uq_migration_idem_open`
+时按 SQLSTATE 23505 + 实际约束名分派：同键同请求重放赢家会话（200），同键不同请求 409
+`IDEMPOTENCY_CONFLICT`（败方整体回滚、拒绝审计独立落痕），同源冲突保持 `MIGRATION_CONFLICT`，
+其它约束/数据库错误原样上抛、绝不误判（回归见 `scripts/race_migration_idem.py` I1–I6）。
+每个关口（nonce/claim/submit）都在迁移行锁内重新校验：会话未完成/未过期、绑定的源/目标**版本摘要**与不可变版本行逐字节一致、
 源与目标版本均未撤销/未过期、提交者确属**源**策略成员。签名协议独立为 `keyvault.migration.v1`，
 与恢复报文互不兼容，签名逐行绑定源/目标摘要，无法把迁移签名挪去恢复、也无法跨目标版本重放。
 
@@ -652,6 +741,7 @@ KEYVAULT_BASE_URL=http://localhost:8000 python -m scripts.demo       # 端到端
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_recovery           # 并发回滚竞态回归（38 项）
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_migration          # 迁移缺片故障转移回归（37 项）
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_destruction        # 谱系逻辑销毁并发回归（D1–D9）
+KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_migration_idem     # 迁移创建并发幂等回归（I1–I6）
 ```
 
 ## 6. 生产注意（本仓库为演示强化基线，上线前至少完成）

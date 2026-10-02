@@ -28,6 +28,18 @@ the existing claim channel, never in the database (only digests) and never in
 audit rows. Revoked/expired versions, cross-tenant references, concurrent and
 repeated migrations are rejected; distinct idempotency keys can never migrate
 the same custody twice; deterministic failures are safe retries.
+
+Concurrent first-time uses of one idempotency key against **different** source
+custodies cannot be serialized by the custody row locks (they are disjoint), so
+both requests can pass the idempotency pre-check; the later insert then hits
+``uq_migration_idem_open``. That unique violation — dispatched by SQLSTATE
+23505 **and** the actual constraint/index name — is translated
+deterministically: the winner's already-committed session is re-read, an
+identical request replays it (200), a different request gets
+``IDEMPOTENCY_CONFLICT`` (409) with the denial audited in its own transaction;
+same-source conflicts stay ``MIGRATION_CONFLICT``; any other constraint or
+database error propagates untouched (never misreported as a conflict). The
+loser's transaction rolls back wholesale — no session row, no success audit.
 """
 from __future__ import annotations
 
@@ -440,9 +452,18 @@ async def start_migration(
                     source_digest = _digest_of_policy(source_policy)
                     target_digest = _digest_of_policy(target_policy)
                     migration_id = deps.new_id("mig")
+                    # 回归闸门：幂等预查与全部确定性校验均已通过、插入占位行之前
+                    # （仅测试构建启用）。同一幂等键对两个**不同**源 custody 的并发
+                    # 请求行锁互不重叠，可能在此双双通过预查——钉住该交错可验证
+                    # 后插入者撞 uq_migration_idem_open 后的确定性 409 与整体回滚。
+                    await faults.maybe_park(request, "migration.after_idem_check")
+                    await faults.maybe_raise(request, "migration.after_idem_check")
                     # savepoint：唯一索引兜底命中后外层事务仍可用于留痕/返回。
                     try:
                         async with conn.transaction():
+                            # 回归闸门（savepoint 内）：注入非目标约束的唯一冲突或
+                            # 通用数据库错误，验证它们绝不被误判为幂等冲突。
+                            await faults.maybe_raise(request, "migration.insert")
                             await conn.execute(
                                 """
                                 INSERT INTO migration_sessions
@@ -458,30 +479,55 @@ async def start_migration(
                                 body.target_policy_id, body.target_version, target_digest,
                                 idem_hash, str(ttl),
                             )
-                    except Exception as exc:  # 并发兜底：同键 open / 同源 open / 同源已完成
-                        if getattr(exc, "pgcode", None) != "23505":
-                            raise
-                        await _raise_unique_conflict(conn, tenant["id"], idem_hash, custody["id"])
-                    await audit.append_audit(
-                        conn, tenant_id=tenant["id"], actor_type="tenant",
-                        actor_id=tenant["id"],
-                        action="migration.start", resource=migration_id, result="ok",
-                        basis={
-                            "source_custody_id": custody["id"],
-                            "source_policy_id": custody["policy_id"],
-                            "source_version": custody["policy_version"],
-                            "source_digest": source_digest,
-                            "target_policy_id": body.target_policy_id,
-                            "target_version": body.target_version,
-                            "target_digest": target_digest,
-                            "ttl_seconds": ttl,
-                            "idempotency_key_digest": idem_hash,
-                        },
-                    )
-                    mig_row = await conn.fetchrow(
-                        "SELECT * FROM migration_sessions WHERE id=$1", migration_id
-                    )
-                    out_count, out_new_digests = 0, None
+                    except Exception as exc:
+                        # 并发兜底：按 SQLSTATE 23505 + 实际约束名区分——同键
+                        # （uq_migration_idem_open）/同源在途（uq_migration_source_open）
+                        # /同源已完成（uq_migration_source_completed）；其余约束与
+                        # 一切非唯一冲突错误原样上抛，绝不误判为幂等冲突。
+                        winner = await _resolve_insert_conflict(
+                            conn, exc, tenant_id=tenant["id"], idem_hash=idem_hash,
+                            source_custody_id=custody["id"],
+                            target_policy_id=body.target_policy_id,
+                            target_version=body.target_version,
+                        )
+                        # 同键同请求的并发插入与赢家相撞：赢家会话已提交，
+                        # 按幂等重放返回（不新建、不重复留痕）。
+                        mig_row = winner
+                        out_count = await conn.fetchval(
+                            "SELECT count(*) FROM migration_share_submissions "
+                            "WHERE migration_id=$1",
+                            winner["id"],
+                        )
+                        out_new_digests = None
+                        if winner["new_custody_id"] is not None:
+                            rows = await conn.fetch(
+                                "SELECT shard_digest FROM shards "
+                                "WHERE custody_id=$1 ORDER BY point_x",
+                                winner["new_custody_id"],
+                            )
+                            out_new_digests = [r["shard_digest"] for r in rows]
+                        replayed = True
+                    else:
+                        await audit.append_audit(
+                            conn, tenant_id=tenant["id"], actor_type="tenant",
+                            actor_id=tenant["id"],
+                            action="migration.start", resource=migration_id, result="ok",
+                            basis={
+                                "source_custody_id": custody["id"],
+                                "source_policy_id": custody["policy_id"],
+                                "source_version": custody["policy_version"],
+                                "source_digest": source_digest,
+                                "target_policy_id": body.target_policy_id,
+                                "target_version": body.target_version,
+                                "target_digest": target_digest,
+                                "ttl_seconds": ttl,
+                                "idempotency_key_digest": idem_hash,
+                            },
+                        )
+                        mig_row = await conn.fetchrow(
+                            "SELECT * FROM migration_sessions WHERE id=$1", migration_id
+                        )
+                        out_count, out_new_digests = 0, None
                 source_threshold = source_policy["threshold"]
         except ApiError as exc:
             # 拒绝同样留痕（独立事务），形成可重放审计；不含任何秘密材料。
@@ -500,42 +546,66 @@ async def start_migration(
     return out
 
 
-async def _raise_unique_conflict(conn, tenant_id: str, idem_hash: str,
-                                 source_custody_id: str) -> None:
-    """Translate a partial-unique-index hit into the deterministic reason."""
-    other_open = await conn.fetchrow(
-        "SELECT id FROM migration_sessions "
-        "WHERE tenant_id=$1 AND idempotency_key_hash=$2 AND status='open' LIMIT 1",
-        tenant_id, idem_hash,
-    )
-    if other_open is not None:
+async def _resolve_insert_conflict(conn, exc: BaseException, *, tenant_id: str,
+                                   idem_hash: str, source_custody_id: str,
+                                   target_policy_id: str, target_version: int):
+    """把插入占位行撞到的唯一冲突翻译为确定性结果；其余原样上抛。
+
+    仅当“同键同请求”的并发重试与赢家相撞时返回赢家会话行（调用方按幂等
+    重放处理）；三条占位部分唯一索引的冲突抛出确定性 ``ApiError``（外层
+    事务整体回滚——败方不留会话、不留成功审计——并在独立事务补记拒绝
+    审计）；非目标约束或任何非唯一冲突错误重新抛出原异常，绝不误判为
+    幂等冲突。
+    """
+    constraint = repo.unique_constraint_name(exc)
+    if constraint == "uq_migration_idem_open":
+        # 同键并发：唯一索引的等待已解析——能撞上就说明赢家的 open 会话
+        # 已提交（赢家若回滚，本插入早已成功）。按与预查相同的口径重读
+        # 赢家行（open/completed；expired/failed/destroyed 不占位）。
+        winner = await conn.fetchrow(
+            "SELECT * FROM migration_sessions "
+            "WHERE tenant_id=$1 AND idempotency_key_hash=$2 "
+            "AND status NOT IN ('expired','failed','destroyed') "
+            "ORDER BY created_at DESC LIMIT 1",
+            tenant_id, idem_hash,
+        )
+        if winner is not None and (
+            winner["source_custody_id"] == source_custody_id
+            and winner["target_policy_id"] == target_policy_id
+            and winner["target_version"] == target_version
+        ):
+            return winner  # 同键同请求：幂等重放，返回原会话
         raise ApiError(
             E_IDEMPOTENCY_CONFLICT,
             basis={"reason": "concurrent_open_with_same_idempotency_key",
-                   "migration_id": other_open["id"]},
+                   "migration_id": winner["id"] if winner is not None else None,
+                   "idempotency_key_digest": idem_hash},
         )
-    dup_open = await conn.fetchrow(
-        "SELECT id FROM migration_sessions WHERE source_custody_id=$1 AND status='open' LIMIT 1",
-        source_custody_id,
-    )
-    if dup_open is not None:
+    if constraint == "uq_migration_source_open":
+        dup_open = await conn.fetchrow(
+            "SELECT id FROM migration_sessions "
+            "WHERE source_custody_id=$1 AND status='open' LIMIT 1",
+            source_custody_id,
+        )
         raise ApiError(
             E_MIGRATION_CONFLICT,
             basis={"reason": "open_migration_exists_for_custody",
-                   "migration_id": dup_open["id"], "source_custody_id": source_custody_id},
-        )
-    done = await conn.fetchrow(
-        "SELECT id FROM migration_sessions "
-        "WHERE source_custody_id=$1 AND new_custody_id IS NOT NULL LIMIT 1",
-        source_custody_id,
-    )
-    if done is not None:
-        raise ApiError(
-            E_MIGRATION_CONFLICT,
-            basis={"reason": "custody_already_migrated", "migration_id": done["id"],
+                   "migration_id": dup_open["id"] if dup_open is not None else None,
                    "source_custody_id": source_custody_id},
         )
-    raise ApiError(E_MIGRATION_CONFLICT, basis={"reason": "duplicate_migration"})
+    if constraint == "uq_migration_source_completed":
+        done = await conn.fetchrow(
+            "SELECT id FROM migration_sessions "
+            "WHERE source_custody_id=$1 AND new_custody_id IS NOT NULL LIMIT 1",
+            source_custody_id,
+        )
+        raise ApiError(
+            E_MIGRATION_CONFLICT,
+            basis={"reason": "custody_already_migrated",
+                   "migration_id": done["id"] if done is not None else None,
+                   "source_custody_id": source_custody_id},
+        )
+    raise exc
 
 
 @router.get("/migrations/{migration_id}", response_model=MigrationSessionOut)
@@ -901,7 +971,7 @@ async def submit_share(body: MigrationShareSubmitIn, request: Request,
                     body.point_x, shard["shard_digest"],
                 )
             except Exception as exc:
-                if getattr(exc, "pgcode", None) == "23505":
+                if repo.unique_constraint_name(exc) is not None:
                     raise ApiError(E_DUPLICATE_SHARE,
                                    basis={"migration_id": body.migration_id,
                                           "custodian_id": custodian["id"]})

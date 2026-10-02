@@ -532,7 +532,7 @@ async def submit_share(body: ShareSubmitIn, request: Request, custodian=deps.Cus
                     body.point_x, shard["shard_digest"],
                 )
             except Exception as exc:  # unique_violation under race
-                if getattr(exc, "pgcode", None) == "23505":
+                if repo.unique_constraint_name(exc) is not None:
                     raise ApiError(E_DUPLICATE_SHARE,
                                    basis={"session_id": body.session_id,
                                           "custodian_id": custodian["id"]})
